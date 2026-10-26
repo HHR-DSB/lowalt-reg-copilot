@@ -1,0 +1,22 @@
+# LowAlt-Reg Copilot 核心依赖（Python 3.9，conda py39 实测版本）
+# 向量数据库
+pymilvus==3.0.2
+
+# Web 服务
+fastapi==0.128.8
+uvicorn==0.39.0
+pydantic==2.11.9
+
+# LLM / Embedding / Rerank（阿里云百炼 OpenAI 兼容端点）
+openai==1.109.1
+
+# 数据提取（三源管线）
+PyMuPDF==1.26.5          # PDF 文字层提取
+beautifulsoup4==4.12.3   # 网页正文解析（div#contxt）
+requests==2.32.3         # 服务间 HTTP 调用
+
+# NLP 工具
+jieba==0.42.1            # 关键词提取（hybrid 检索的关键词路）
+
+# 配置
+python-dotenv==1.0.1     # .env 加载 DASHSCOPE_API_KEY（.env 不入库）

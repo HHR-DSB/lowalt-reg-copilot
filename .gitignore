@@ -1,0 +1,21 @@
+# ===== 环境与密钥（绝不提交）=====
+.env
+
+# ===== Milvus 数据卷（GB 级且动态变化，绝不能进 git）=====
+volumes/
+
+# ===== Python =====
+__pycache__/
+*.pyc
+*.egg-info/
+
+# ===== 中间产物（可由脚本重新生成）=====
+ocr_cache/
+.uploads/
+*.log
+
+# ===== IDE / 系统 =====
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
