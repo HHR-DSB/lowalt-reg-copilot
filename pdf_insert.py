@@ -20,7 +20,19 @@ import milvus_config as config
 
 # ============================ 配置区 ============================
 
-COLLECTION_NAME = "lowalt_reg_kb"        # 正式集合（沙箱版叫 pdf_practice；正式库单独建，不混练习数据）
+# ---- 切块策略开关（10-27 对比实验完成，条文切块胜出定为生产配置）----
+# "sliding" = 滑窗 400+80（阶段 1 配置，对照组；老库 lowalt_reg_kb 保留）
+# "article" = 条文边界切块（"第X条"原子单元 + 同章短条合并，生产配置）
+# 实验结论（9 题 RAGAS，唯一变量=切块策略）：faithfulness 0.749→0.781、
+# precision 0.890→0.909、recall 0.889 持平——两升一平无下降 + Q7 满分质变
+# （0.846→1.000：完整条文在场→出处断言逐字可查证）；9 题样本下均值差异温和
+# （不具统计显著性），决策依据另含产品价值：引用粒度=检索粒度
+CHUNK_STRATEGY = "article"
+
+COLLECTION_NAME = (
+    "lowalt_reg_kb" if CHUNK_STRATEGY == "sliding"
+    else "lowalt_reg_kb_v2"   # 条文切块实验库
+)
 
 DRY_RUN = False                            # True  = 空跑：只做提取/清洗/切块并打印样本
                                          #        不连 Milvus、不调 embedding API（零成本）
@@ -58,6 +70,19 @@ DOCS = [
 # （误识别的后果只是 section 标签错，不伤检索正文——可接受的妥协）
 CHAPTER_PAT = re.compile(
     r"(?:^|\n)\s*([A-Z]\s*章[^\n]{0,25}|第[一二三四五六七八九十百]+章[^\n]{0,25})"
+)
+
+# 条文起点正则（article 策略）：两个分支对应两种编号风格
+#   第[一二三四五六七八九十百千零]+条 → 条例/川规定/川运行规则的中文数字条（"第三十四条"）
+#   第\d{2,3}\.\d{1,4}\s*条           → CCAR-92 的节号条（实测 "第92.329 条"带空格；
+#     小数部分 \d{1,4} 上限 4 位——DRY_RUN 首轮抓到的 bug：92.1001（M 章首条）
+#     是 4 位，\d{1,3} 漏匹配导致它跟在前一块尾部跨章混块）
+# 关键设计：锚定行首（^|\n）——区分"条文开头"与"正文引用"。
+# 法规排版惯例是每条另起一行，而正文句中引用（实测样本"按照本规则第92.329 条确定的…"）
+# 不在行首。若不锚定，正文引用处会被误切成段边界，一条法规被引用句拦腰截断。
+# 与 CHAPTER_PAT 同款行首锚定策略（包括同样的局限：OCR 断行不可靠时可能漏——靠 DRY_RUN 验证）
+ARTICLE_PAT = re.compile(
+    r"(?:^|\n)\s*(第[一二三四五六七八九十百千零]+条|第\s*\d{2,3}\.\d{1,4}\s*条)"
 )
 
 
@@ -249,6 +274,72 @@ def sliding_window_chunks(text: str, chunk_size: int = 400, overlap: int = 80) -
     return chunks
 
 
+def article_chunks(text: str, min_len: int = 120, max_len: int = 500) -> list:
+    """条文边界切块：一条法规 = 一个原子单元，同章内短条贪心合并
+
+    与滑窗的哲学差异：
+      滑窗保证"块大小均匀"（为 embedding 友好，向量表示质量稳定）
+      条文切块保证"语义单元完整"（一条讲一件事；引用天然对齐"第X条"，
+      用户问"第三十四条"时检索粒度 = 引用粒度）
+
+    短条合并是两者的折中：单条太短（有的条文只有一行）embedding 上下文不足，
+    所以同章内贪心合并到 min_len 以上——"章内"约束防止章末短条与下章内容
+    混块导致 section 标签错位（这正是滑窗方案的老伤，见 Q9 错位案例）。
+
+    超长条文（> max_len）保持独立不再切：条文完整性优先于块大小均匀——
+    切半条比大块更伤（这就是要修的"法条腰斩"问题本身）。
+
+    返回 [(偏移, 块文本)] 与滑窗同构，insert_pdf_data 无需感知差异。
+    防御性回退：匹配不到任何条文 → 返回 []，调用方回退滑窗。
+    """
+    matches = list(ARTICLE_PAT.finditer(text))
+    if not matches:
+        return []
+
+    chapters = find_chapters(text)
+    raw = []
+
+    # 第一条之前的"前言块"（公布令/总则导语）：单独成块，不与条文混
+    if matches[0].start() > 0:
+        head = text[:matches[0].start()].strip()
+        if head:
+            raw.append((0, head))
+
+    # 按条文起点切段：每条 = 本条起点 → 下一条起点之间的全部文本
+    # （包含条内款项"（一）…"和续行——它们不是行首"第X条"，不会被切开）
+    for i, m in enumerate(matches):
+        start = m.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        raw.append((start, text[start:end].strip()))
+
+    # 同章内贪心合并：当前块过短 → 并入前块（前块不超 max_len 且同章）
+    merged = []
+    for offset, piece in raw:
+        if (merged
+                and len(piece) < min_len
+                and len(merged[-1][1]) + len(piece) < max_len
+                and chapter_of(chapters, merged[-1][0]) == chapter_of(chapters, offset)):
+            merged[-1] = (merged[-1][0], merged[-1][1] + "\n" + piece)
+        else:
+            merged.append((offset, piece))
+    return merged
+
+
+def chunk_text(text: str, chunk_size: int = 400, overlap: int = 80) -> list:
+    """切块策略分发：按 CHUNK_STRATEGY 选路，两条路径返回同构 [(偏移, 块文本)]
+
+    article 匹配不到条文时回退滑窗（防御性：语料形态变化不炸管线）——
+    回退必须打印警告而非静默：静默回退会让"实验组其实混着滑窗数据"这类事故
+    无声发生（今天 RAGAS 调试的同款教训：跑的东西必须是你以为在跑的东西）
+    """
+    if CHUNK_STRATEGY == "article":
+        chunks = article_chunks(text)
+        if chunks:
+            return chunks
+        print("  ⚠ 未匹配到任何条文起点，回退滑窗切块（该文档将混入滑窗数据，对比解读时注意）")
+    return sliding_window_chunks(text, chunk_size, overlap)
+
+
 # ============================ 集合与入库 ============================
 
 def create_pdf_collection():
@@ -313,7 +404,7 @@ def insert_pdf_data(collection, doc_path: str, source_name: str, mode: str = "pd
     header = source_name.split("（")[0]                # 页眉 = 规范名去括号（页眉不含"（CCAR-92部）"这类后缀）
     text = extract_text(doc_path, header, mode)
     chapters = find_chapters(text)
-    chunks = sliding_window_chunks(text, chunk_size, overlap)
+    chunks = chunk_text(text, chunk_size, overlap)     # 策略分发：sliding / article 同构返回
 
     print(f"\n开始处理: {source_name}")
     print(f"  清洗后全文 {len(text)} 字 → {len(chunks)} 个切片，识别出 {len(chapters)} 个章节")
@@ -362,7 +453,7 @@ if __name__ == "__main__":
             header = source_name.split("（")[0]
             text = extract_text(doc_path, header, mode)
             chapters = find_chapters(text)
-            chunks = sliding_window_chunks(text)
+            chunks = chunk_text(text)
 
             print(f"\n===== {source_name} =====")
             print(f"清洗后 {len(text)} 字 → {len(chunks)} 个切片")

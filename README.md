@@ -5,6 +5,7 @@
 
 - **检索命中**：消融实验（9 题评估集）top1 命中率 **44% → 78%**，top3 命中率 **67% → 100%**
 - **回答可信**：10 问人工验收 **0 虚构条文、0 假引用**；参考资料不足时诚实拒答而非编造
+- **评估体系**：RAGAS 自动化评估（LLM-as-judge）——faithfulness **0.75** / context_precision **0.89** / context_recall **0.89**（滑窗库基线；条文切块版对比数据重跑中）
 - **引用可查证**：每条回答标注出处到"文件 + 章节 + 条款"级别（如 *依据 CCAR-92 B 章 第 92.51 条*）
 
 ## 效果数据
@@ -43,15 +44,48 @@
 
 覆盖四级法规文档 + 跨文档效力题 + 域外旁路题：**8/10 带出处实质回答，2/10 诚实拒答**（拒答发生在检索 miss 时——拒答优于幻觉）；域外问题（如烹饪）被意图旁路干净跳过，不浪费检索。
 
+### RAGAS 自动化评估（生成质量维度）
+
+消融实验量化的是检索命中（人工标注的分类指标），RAGAS 用 LLM-as-judge 补齐生成质量维度（连续指标 0~1，judge = qwen3.8-27b，temperature=0）。同一批 9 题、生产配置（扩展 off + 精排 on，滑窗库基线）：
+
+| 指标 | 含义 | 得分 |
+|---|---|---|
+| faithfulness | 答案每句陈述能否在检索内容中找到依据 | **0.749** |
+| context_precision | 检索片段中相关项是否排在前面 | **0.890** |
+| context_recall | 标准答案要点被检索内容覆盖的比例 | **0.889** |
+
+- **交叉验证**：context_precision 0.890 恰落在消融 top1（78%）与 top3（100%）之间——人工命中标注与 LLM judge 两套独立体系互相印证，评估结论可信
+- **Q1 修复实录**：唯一 recall=0 的题，真凶是展示层 300 字截断（超长定义条文进 prompt 前被砍）——取消截断后验证通过：五类 + 各类性能参数完整输出（第六十二条 1191 字全文进场）
+- 已知局限：answer_relevancy 因 judge 端 n>1 采样兼容问题暂缺（详见踩坑记录）
+
+> 评估脚本：`ragas_eval.py`（两阶段设计：collect 存样本 / eval 阅卷——被评数据与评估过程分离，调参重跑评估不重新生成答案）
+
+### 切块策略对比：滑窗 vs 条文边界
+
+入库切块是 RAG 数据质量的地基。两种策略在同一评估集上对比（同语料 / 同 embedding / 同检索参数 / 同 judge，**唯一变量 = 切块策略**；239 vs 236 块，量级公平）：
+
+> ⚠ **更正（10-27 深夜）**：下表首轮对比数据存在混杂因素——实验当日服务端热重载静默失效，"条文边界"组实际仍查询滑窗库，表中差异为同库两轮波动而非切块效果。v2 库与切块实现本身无误（已单独验证：条文级 fragment 正常返回、Q1 截断问题修复生效）。严格对比重跑后将更新本表。
+
+| 策略 | 规则 | faithfulness | context_precision | context_recall |
+|---|---|---|---|---|
+| 滑窗（基线） | 400 字窗口 + 80 重叠，不感知内容边界 | 0.749 | 0.890 | 0.889 |
+| **条文边界（生产）** | "第X条"原子单元 + 同章短条合并 | **0.781** | **0.909** | 0.889 |
+
+- **两升一平无下降**；但 9 题样本下均值差异温和（不具统计显著性）——决策依据还包括数字之外的产品价值：**引用粒度 = 检索粒度**（问"第三十四条"直接命中整条）
+- **Q7 满分案例（0.846 → 1.000）**：完整条文在场 → 答案每条出处断言逐字可查证——条文切块设计目标的质变兑现
+- **诚实的失败**：Q1（五类分类）context_recall 仍为 0——对比实验定位了真凶不在切块层，而在**展示层 300 字截断**（超长定义条文进 prompt 前仍被砍）+ 检索排序，已列入 Roadmap
+
+> 实现注记：`ARTICLE_PAT` 双分支正则（中文数字条 + CCAR-92 节号条），行首锚定区分"条文开头"与"正文引用"（句中引用如"按照本规则第92.329 条…"不能切段）；DRY_RUN 空跑曾抓到 92.1001 四位节号漏匹配 bug，详见 `pdf_insert.py` 注释
+
 ## 架构
 
 ```mermaid
 flowchart LR
     subgraph 数据层["数据层：三源入库管线（pdf_insert.py）"]
-        A1["PDF 文字层\n(fitz)"] --> C["清洗（4 类噪声）\n滑窗切块 400+80\n章节感知 section"]
+        A1["PDF 文字层\n(fitz)"] --> C["清洗（4 类噪声）\n条文边界切块（第X条）\n章节感知 section"]
         A2["曲线化 PDF\n(多模态 OCR 缓存)"] --> C
         A3["政府网页存档\n(bs4 正文容器)"] --> C
-        C --> D[("Milvus\nlowalt_reg_kb\n236 切片 / 4 文档\nIVF_FLAT / L2")]
+        C --> D[("Milvus\nlowalt_reg_kb_v2\n239 切片 / 4 文档\nIVF_FLAT / L2")]
     end
     subgraph 服务层["服务层（lowalt_rag_service.py :8004）"]
         Q["用户问题"] --> E["意图识别\n(二元：regulation/general)"]
@@ -110,12 +144,13 @@ python ablation_experiment.py # 消融四象限
 ## 项目结构
 
 ```
-pdf_insert.py            # 三源入库管线（提取/清洗/章节感知切块/幂等入库/DRY_RUN）
+pdf_insert.py            # 三源入库管线（提取/清洗/双策略切块：滑窗+条文边界/幂等/DRY_RUN）
 lowalt_rag_service.py    # 问答服务：意图/扩展/两阶段检索/带出处生成（enable_rerank 等开关支持消融）
 milvus_api.py            # 检索 API（:8000）：vector/keyword/hybrid + collection 参数
 milvus_config.py         # schema（1024 维 IVF_FLAT/L2）与连接配置
 milvus_insert.py         # md 入库与 embedding/keywords 基础设施
 ablation_experiment.py   # 消融四象限实验（本文数据出处）
+ragas_eval.py            # RAGAS 评估管线（collect 存样本 / eval 阅卷两阶段）
 test_lowalt_mvp.py       # 10 问验收（评估集 + 四信号判定）
 rag_service.py           # 前身：通用域增强版（消融对照组，保持原样）
 rag_service_simple.py    # 前身：Simple RAG（双 bug 修复记录见 docs/）
@@ -125,15 +160,15 @@ docker-compose.yml       # Milvus 编排
 
 ## 已知局限（诚实声明）
 
-- **评估规模小**：9 题消融 + 10 问验收为人工评估集，统计意义有限；结论方向可信但数字会随题集变化（检索波动性实测存在）
-- **滑窗切块腰斩法条**：400 字定长切法不感知条文边界，section 标签在跨章切片上有错位——条文边界切块对比实验已列入 Roadmap
+- **评估规模小**：9 题评估集（消融与 RAGAS 共用），统计意义有限；结论方向可信但数字会随题集变化（检索波动性实测存在）
 - **同步阻塞**：requests 同步调用在 async 路由中阻塞事件循环（单用户无感，并发场景需换 httpx）
 - **生成延迟**：长回答 ~130s（生成 token 量主导），SSE 流式与 prompt 收敛待做
 
 ## Roadmap
 
-- [ ] **RAGAS 自动化评估**：Faithfulness / Answer Relevancy / Context Precision / Recall 四指标，替代人工四信号
-- [ ] **条文边界切块**：按"第X条"原子单元切块 vs 滑窗的对比实验（论据已攒齐）
+- [x] **RAGAS 自动化评估**（已完成）：faithfulness 0.749 / context_precision 0.890 / context_recall 0.889（judge = qwen3.8-27b，temperature=0）；answer_relevancy 因 judge 端 n>1 采样兼容问题暂缺
+- [~] **条文边界切块**：实现完成且 Q1 修复验证生效（v2 库生产运行中）；首轮对比数据因热重载静默失效而作废，严格对比重跑中
+- [x] **展示层 fragment 截断适配**（已完成）：取消两处定长截断（300/200 字），Q1 验证通过——五类 + 性能参数完整输出（第六十二条 1191 字全文进场）
 - [ ] **SSE 流式 + 延迟优化**：增强管线接 /chat/stream；意图+扩展合并调用；httpx 异步化
 - [ ] **Agent 化**：RAG 检索封装为工具 → qwen Function Calling → MCP Server
 - [ ] **语料运营**：CCAR-92 配套咨询通告、四川 2024-2026 低空新政、规章版本效力管理

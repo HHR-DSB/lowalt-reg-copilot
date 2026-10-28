@@ -8,7 +8,15 @@ uvicorn==0.39.0
 pydantic==2.11.9
 
 # LLM / Embedding / Rerank（阿里云百炼 OpenAI 兼容端点）
-openai==1.109.1
+# ⚠ 10-27 openai 1.109.1 → 2.48.0：装 ragas 时被 langchain-openai 连带升级，实测与现有代码兼容
+openai==2.48.0
+
+# RAGAS 评估体系（10-27 新增）
+ragas==0.4.3              # LLM-as-judge 四指标评估（faithfulness / context_precision / context_recall）
+langchain-openai==0.3.35  # ragas judge 的 ChatOpenAI/OpenAIEmbeddings 接入层
+
+# 开发环境
+watchfiles==1.1.1         # uvicorn reload 引擎（不装则 reload_excludes 无效，见踩坑记录）
 
 # 数据提取（三源管线）
 PyMuPDF==1.26.5          # PDF 文字层提取

@@ -49,7 +49,12 @@ DASHSCOPE_API_KEY = os.getenv("DASHSCOPE_API_KEY")
 
 # 本服务的目标集合：milvus_api.py 已支持 /query 传 collection 参数（默认 None 走旧库）。
 # 定义成模块级常量而不是散落在各个函数里 —— 集合名是"部署配置"，改一处即全局生效
-TARGET_COLLECTION = "lowalt_reg_kb"
+#
+# v2 = 条文边界切块库（10-27 对比实验后定为生产配置）：
+#   vs 滑窗版（lowalt_reg_kb）：faithfulness 0.749→0.781、precision 0.890→0.909、
+#   recall 持平——两升一平无下降 + Q7 满分质变（完整条文在场→引用逐字可查证）
+#   + 产品价值：引用粒度=检索粒度（问"第X条"直接命中整条）。老库保留作对照组
+TARGET_COLLECTION = "lowalt_reg_kb_v2"
 
 # ---- Rerank 精排配置（两阶段检索的第二阶段）----
 # 注意端点不是 OpenAI 兼容格式，是 DashScope 原生 API —— rerank 不是 chat 任务，没有 messages 结构
@@ -86,7 +91,10 @@ class ChatRequest(BaseModel):
     top_k: int = Field(5, description="检索文档数量")
     search_type: str = Field("hybrid", description="检索类型")
     stream: bool = Field(False, description="是否流式输出")
-    enable_query_expansion: bool = Field(True, description="是否启用查询扩展")
+    # 消融结论落地（10-26 实验）：查询扩展在朴素分数融合下单独使用为负贡献
+    # （C 象限 top1 3/9 < 基线 4/9），rerank 以原始问题为唯一基准打分后无增量收益
+    # ——生产默认关闭。显式传 True 可重新启用（消融实验复现用）
+    enable_query_expansion: bool = Field(False, description="是否启用查询扩展（默认关：消融实验结论）")
     enable_intent_detection: bool = Field(True, description="是否启用意图识别")
     # Rerank 开关——与上面两个开关并列，消融实验的四象限就此齐了：
     #   扩展 on/off × 精排 on/off，用同一批验收问题对比，量化每个模块的独立贡献
@@ -136,7 +144,7 @@ class RAGPipeline:
             ]
 
             completion = llm_client.chat.completions.create(
-                model="qwen3.8-27b",
+                model="qwen3.8-max",
                 messages=messages,
                 temperature=0.1,  # 低温度使结果更确定——分类任务要稳定不要创意
                 max_tokens=200
@@ -206,7 +214,7 @@ class RAGPipeline:
             ]
 
             completion = llm_client.chat.completions.create(
-                model="qwen3.8-27b",
+                model="qwen3.8-max",
                 messages=messages,
                 temperature=0.7,   # 扩展要多样性，高温度——和分类任务相反
                 max_tokens=200
@@ -387,12 +395,13 @@ class RAGPipeline:
 
         for i, result in enumerate(results[:5], 1):  # 最多使用5个文档
             text = result.get('text', '')
-            # 截取相关片段
-            fragment_length = 300
-            if len(text) > fragment_length:
-                fragment = text[:fragment_length] + "..."
-            else:
-                fragment = text
+            # fragment = 完整 chunk（10-27 取消 300 字截断）：
+            # 截断是"上下文超预算"的手段，但 5 块 × 500 字 ≈ 2500 字对
+            # 128k 窗口是零头——本没有预算问题。300 字截断是滑窗时代的节俭
+            # 设计（chunk 400 砍到 300 代价可忽略），条文块时代 chunk 最长 500
+            # 字，且完整条文是引用可查证性的载体（Q1 案例：五类定义条文超
+            # 300 字被砍 → context_recall=0）。技术债形态：前提变了设计没跟上
+            fragment = text
 
             source = result.get('source', '未知来源')
             section = result.get('section', '')
@@ -405,7 +414,9 @@ class RAGPipeline:
                 "source": source,
                 "section": section,
                 "score": result.get('score', 0),
-                "fragment": fragment[:200] + "..." if len(fragment) > 200 else fragment
+                # 完整片段（取消 200 字二次截断）：RAGAS 的 contexts 正是用
+                # 这个字段组装——这里砍一刀，评估就拿残料算，分数失真
+                "fragment": fragment
             })
 
         return "\n\n".join(context_parts), fragments
@@ -449,14 +460,14 @@ class RAGPipeline:
 
             if stream:
                 completion = llm_client.chat.completions.create(
-                    model="qwen3.8-27b",
+                    model="qwen3.8-max",
                     messages=messages,
                     stream=True
                 )
                 return completion
             else:
                 completion = llm_client.chat.completions.create(
-                    model="qwen3.8-27b",
+                    model="qwen3.8-max",
                     messages=messages,
                     stream=False
                 )
@@ -719,7 +730,7 @@ async def chat_with_history(
 
     try:
         completion = llm_client.chat.completions.create(
-            model="qwen3.8-27b",
+            model="qwen3.8-max",
             messages=messages,
             stream=False
         )
